@@ -10,8 +10,8 @@ Secrets needed (Streamlit Cloud -> App settings -> Secrets):
   GROQ_API_KEY = "gsk_..."
 Optional:
   APP_PASSWORD = "something"          # asks visitors for a password
-  GROQ_CHAT_MODEL = "llama-3.1-8b-instant"
-  GROQ_STT_MODEL  = "whisper-large-v3-turbo"
+  GROQ_CHAT_MODEL = "..."   # normally NOT needed: the app picks an available model itself
+  GROQ_STT_MODEL  = "..."
 """
 
 import io
@@ -24,7 +24,6 @@ from pathlib import Path
 
 import requests
 import streamlit as st
-import pypdf
 from pypdf import PdfReader
 
 st.set_page_config(page_title="AI Interview Coach", page_icon="🎤", layout="centered")
@@ -34,6 +33,7 @@ st.set_page_config(page_title="AI Interview Coach", page_icon="🎤", layout="ce
 # =====================================================================
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_STT_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 
 
 def get_secret(name, default=""):
@@ -46,9 +46,18 @@ def get_secret(name, default=""):
 
 
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
-# Model names change over time - check console.groq.com/docs/models
-CHAT_MODEL = get_secret("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
-STT_MODEL = get_secret("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+# Groq retires models often, so the app asks Groq which models exist and picks
+# the first available one from these lists (best first). You can force a model
+# with the optional GROQ_CHAT_MODEL / GROQ_STT_MODEL secrets.
+CHAT_PREFERRED = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+STT_PREFERRED = ["whisper-large-v3-turbo", "whisper-large-v3"]
+CHAT_OVERRIDE = get_secret("GROQ_CHAT_MODEL")
+STT_OVERRIDE = get_secret("GROQ_STT_MODEL")
 APP_PASSWORD = get_secret("APP_PASSWORD")
 
 # Put your knowledge-base PDFs in a "knowledge_base" folder next to app.py
@@ -175,6 +184,11 @@ def _check_response(r):
         )
     if r.status_code in (401, 403):
         raise LLMError("The API key was rejected. Please check GROQ_API_KEY in the app's secrets.")
+    if r.status_code == 404 and "model" in r.text.lower():
+        raise LLMError(
+            "The AI model is no longer available on Groq. Remove any GROQ_CHAT_MODEL / "
+            "GROQ_STT_MODEL secret, or set it to a current model from console.groq.com/docs/models."
+        )
     if not r.ok:
         raise LLMError(f"API error {r.status_code}: {r.text[:200]}")
 
@@ -185,27 +199,64 @@ def _auth_headers():
     return {"Authorization": f"Bearer {GROQ_API_KEY}"}
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def list_available_models(api_key: str):
+    try:
+        r = requests.get(GROQ_MODELS_URL, headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+        if r.ok:
+            return [m.get("id", "") for m in r.json().get("data", [])]
+    except Exception:
+        pass
+    return []
+
+
+def _pick_model(preferred, override, fallback):
+    if override:
+        return override
+    available = list_available_models(GROQ_API_KEY) if GROQ_API_KEY else []
+    for name in preferred:
+        if name in available:
+            return name
+    return fallback
+
+
+def get_chat_model():
+    return _pick_model(CHAT_PREFERRED, CHAT_OVERRIDE, "openai/gpt-oss-20b")
+
+
+def get_stt_model():
+    return _pick_model(STT_PREFERRED, STT_OVERRIDE, "whisper-large-v3")
+
+
 def llm_chat(prompt, temperature=0.2, json_mode=False, seed=None):
+    model = get_chat_model()
+    reasoning_model = "gpt-oss" in model
     payload = {
-        "model": CHAT_MODEL,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": temperature,
-        "max_tokens": 1200,
+        # reasoning models spend part of this budget on hidden thinking
+        "max_tokens": 4000 if reasoning_model else 1200,
     }
+    if reasoning_model:
+        payload["reasoning_effort"] = "low"
     if json_mode:
         payload["response_format"] = {"type": "json_object"}
     if seed is not None:
         payload["seed"] = seed
 
     headers = _auth_headers()
-    for attempt in range(2):
+    for attempt in range(3):
         r = requests.post(GROQ_CHAT_URL, headers=headers, json=payload, timeout=60)
+        if r.status_code == 400 and "reasoning_effort" in payload and "reasoning" in r.text.lower():
+            payload.pop("reasoning_effort", None)  # this model doesn't accept it
+            continue
         if r.status_code == 429 and attempt == 0:
             try:
                 wait = float(r.headers.get("retry-after", 5))
             except ValueError:
                 wait = 5
-            if wait <= 10:  # short per-minute limit: wait and retry once
+            if wait <= 20:  # short per-minute limit: wait and retry once
                 time.sleep(wait)
                 continue
         _check_response(r)
@@ -475,7 +526,7 @@ def transcribe(audio_bytes: bytes) -> str:
         headers=_auth_headers(),
         files={"file": ("answer.wav", audio_bytes, "audio/wav")},
         data={
-            "model": STT_MODEL,
+            "model": get_stt_model(),
             "language": "en",
             "response_format": "json",
             "temperature": "0",
@@ -612,7 +663,7 @@ with st.sidebar:
     if not GROQ_API_KEY:
         st.error("GROQ_API_KEY is not set.")
     else:
-        st.success("AI service connected")
+        st.success(f"AI service connected\n\nModel: {get_chat_model()}")
 
     if s.stage not in ("welcome", "upload"):
         st.markdown("---")
